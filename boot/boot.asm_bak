@@ -1,0 +1,248 @@
+;
+;
+
+%ifdef _BOOT_DEBUG_
+	org 0100h
+%else
+	org 07c00h
+%endif
+
+;====================================================
+%ifdef _BOOT_DEBUG_
+BaseOfStack		equ 0100h		; 调试模式下堆栈基地址(栈底, 从这个位置向低地址生长)
+%else
+BaseOfStack		equ 07c00h		; boot模式下堆栈基地址(栈底, 从这个位置向低地址生长)
+%endif
+
+%include "load.inc"
+;====================================================
+
+	jmp short LABEL_START		;Start to boot
+	nop							;这个nop 不可少
+
+; 下面是FAT12 磁盘头
+%include "fat12hdr.inc"
+
+LABEL_START:
+	mov ax, cs
+	mov ds, ax
+	mov es, ax
+	mov ss, ax
+	mov sp, BaseOfStack
+
+	;清屏
+	mov ax, 0600h		; AH=6 AL=0h
+	mov bx, 0700h		; 黑底白字(BL=07h)
+	mov cx, 0			; 左上角(0,0)
+	mov dx, 01840fh		; 右下角(80,50)
+	int 10h				;
+
+	mov dh, 0			;"Booting "
+	call DispStr		;显示字符串
+	
+	xor ah, ah			; ┓
+	xor dl, dl			; ┣ 软驱复位
+	int 13h				; ┛
+
+; 下面在A盘的根目录寻找LOADER.BIN
+	mov word [wSectorNo], SectorNoOfRootDirectory
+LABEL_SEARCH_IN_BOOT_DIR_BEGIN:
+	cmp word [wRootDirSizeForLoop], 0 	;┓
+	jz LABEL_NO_LOADERBIN				;┣ 判断根目录去是不是已经读完
+	dec word [wRootDirSizeForLoop]		;┛ 如果读完了则表示没有找到 LOADER.BIN
+	mov ax, BaseOfLoader
+	mov es, ax
+	mov bx, OffsetOfLoader;
+	mov ax, [wSectorNo]
+	mov cl, 1
+	call ReadSector
+
+	mov si, LoaderFileName
+	mov di, OffsetOfLoader
+	cld
+	mov dx, 10h
+LABEL_SEARCH_FOR_LOADERBIN:
+	cmp dx, 0
+	jz LABEL_GOTO_NEXT_SECTOR_IN_ROOT_DIR;
+	dec dx
+	mov cx, 11
+LABEL_CMP_FILENAME:
+	cmp cx, 0
+	jz LABEL_FILENAME_FOUND
+dec cx
+	lodsb
+	cmp al, byte[es:di]
+	jz LABEL_GO_ON
+	jmp LABEL_DIFFERENT
+;我们要找到 LOADER.BIN
+LABEL_GO_ON:
+	inc di
+	jmp LABEL_CMP_FILENAME	;
+
+LABEL_DIFFERENT:
+	and di, 0FFE0h;
+	and di, 20h
+	mov si, LoaderFileName
+	jmp LABEL_SEARCH_FOR_LOADERBIN	;
+	
+LABEL_GOTO_NEXT_SECTOR_IN_ROOT_DIR:
+	add word [wSectorNo], 1
+	jmp LABEL_SEARCH_IN_ROOT_DIR_BEGIN
+
+LABEL_NO_LOADERBIN:
+	mov dh, 2
+	call DispStr
+
+%ifdef _BOOT_DEBUG_
+	mov ax, 4c00h
+	int 21h
+%else
+	jmp $
+%endif
+
+LABEL_FILENAME_FOUND:
+	mov ax, RootDirSectors
+	and di, 0FFE0h
+	add di, 01Ah
+	mov cx, word [es:di]
+	push cx
+	add cx, ax
+	add cx, DeltaSectorNo
+	mov ax, BaseOfLoader
+	mov es, ax
+	mov bx, OffsetOfLoader
+	mov ax, cx
+
+LABEL_GOON_LOADING_FILE:
+	push ax
+	push bx
+	mov ah, 0Eh
+	mov al, '.'
+	mov bl, 0Fh
+	int 10h
+	pop bx
+	pop ax
+	
+	mov cl, 1
+	call ReadSector
+	pop ax
+	call GetFATEntry
+	cmp ax, 0FFFh
+	jz LABEL_FILE_LOADED
+	push ax
+	mov dx, RootDirSectors
+	add ax, dx
+	add ax, DeltaSectorNo
+	add bx, [BPB_BytePerSec]
+	jmp LABEL_GOON_LOADING_FILE
+
+LABEL_FILE_LOADED:
+	mov dh, 1
+	call DispStr				
+
+	jmp BaseOfLoader:OffsetOfLoader ;
+	
+	
+;==============================================
+; 变量
+;---------------------------------------------
+wRootDirSizeForLoop	dw RootDirSectors	;Root Directory 占用的扇区数, 在循环中会递减至零
+wSectorNo			dw 0				;要读取的扇区号
+bOdd				db 0				;奇数还是偶数
+
+;=============================================
+;字符串
+;----------------------------------------------
+LoaderFileName		db "LOADER  BIN", 0
+;为了简化代码, 下面每个字符串的长度均为 MessageLength
+MessageLength		equ 9
+BootMessage:		db "Booting  "	; 9 字节不够则用空格补齐, 序号0
+Message1:			db "Ready.   "	; 9 字节不够则用空格补齐, 序号1
+Message2:			db "No LOADER"	; 9 字节不够则用空格补齐, 序号2
+;=======================================================
+
+;------------------------------------------------
+; 函数名: DispStr
+;-----------------------------------------------
+; 作用:
+;      显示一个字符串, 函数开始时dh 中应该是字符串序号(0-based)
+DispStr:
+	mov ax, MessageLength
+	mul dh
+	add ax, BootMessage
+	mov bp, ax
+	mov ax, ds
+	mov es, ax
+	mov cx, MessageLength
+	mov ax, 01301h
+	mov bx, 0007h
+	mov dl, 0
+	int 10h
+	ret
+
+;-------------------------------------------------
+; 函数名: ReadSector
+;-------------------------------------------------
+; 作用:
+;		从ax个Sector 开始, 将 cl 个Sector读入es:bx 中
+ReadSector:
+    ; -----------------------------------------------------------------------
+    ; 怎样由扇区号求扇区在磁盘中的位置 (扇区号 -> 柱面号, 起始扇区, 磁头号)
+    ; -----------------------------------------------------------------------
+    ; 设扇区号为 x
+    ;                          ┌ 柱面号 = y >> 1
+    ;       x           ┌ 商 y ┤
+    ; -------------- => ┤      └ 磁头号 = y & 1
+    ;  每磁道扇区数     │
+    ;                   └ 余 z => 起始扇区号 = z + 1
+	push bp
+	mov bp, sp
+	sub esp, 2			; 辟出两个字节的堆栈区域保存要读的扇区数 byte[bp-2]
+	
+	mov byte[bp-2], cl
+	push bx
+	mov bl, [BPB_SecPelTrk]	;
+	div bl
+	inc ah
+	mov cl, ah
+	mov dh, al
+	shr al, 1
+	mov ch, al
+	and dh, 1
+	pop bx
+	;
+	mov dl, [BS_DrvNum]	;
+.GoOnReading:
+	mov ah, 2
+	mov al, byte [bp-2]
+	int 13h
+	jc .GoOnReading
+
+	add esp, 2
+	pop bp
+
+;---------------------------------------------------------
+; 函数名:GetFATEntry
+;---------------------------------------------------------
+; 作用:
+;		找到序号ax的Sector 在FAT中的条目, 结果放在ax 中
+; 		需要注意的是,中间需要读FAT的扇区到es:bx 出, 作用函数一开始保存了 es 和 bx
+GetFATEntry:
+	push es
+	push bx
+	push ax
+
+
+
+	pop bx
+	pop es
+	ret
+
+;-------------------------------------------------------------
+time 510-($-$$) db	0
+dw 0xaa55					;结束标志
+
+	
+	
+
+

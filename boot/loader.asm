@@ -1,10 +1,20 @@
 
 org 0100h
+	jmp LABEL_START			
 
-	mov ax, 0B800h
-	mov gs. ax
-	mov ah, 0Fh		; 0000 黑底 1111: 白字
-	mov al, 'L'
-	mov [gs:((80 * 0 + 39) * 2)], ax	;屏幕第0行, 第39列
+%include "fat12hdr.inc"
+%include "load.inc"
+%include "pm.inc"
 
-	jmp $	
+
+BaseOfStack equ 0100h
+
+LABEL_START:
+	mov ax, cs
+	mov ds, ax
+	mov es, ax
+	mov ss, ax
+	mov sp, BaseOfStack
+	
+	mov dh, 0
+	call DispStrRealMode
